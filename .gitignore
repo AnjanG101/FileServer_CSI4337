@@ -1,0 +1,18 @@
+.codex
+
+# Build outputs
+server
+client
+server_manual_check
+client_manual_check
+*.o
+*.out
+
+# Local test files
+test.txt
+
+# Editor and OS clutter
+*.swp
+*.swo
+*~
+.DS_Store
