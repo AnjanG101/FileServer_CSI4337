@@ -4,13 +4,15 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
+#include <list>
 #include <mutex>
 #include <netinet/in.h>
 #include <optional>
-#include <queue>
 #include <string>
+#include <unordered_map>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
@@ -20,17 +22,25 @@
 namespace {
 
 constexpr std::size_t kMaxFilenameSize = 1024;
-constexpr std::size_t kBufferSize = 4096;
 constexpr int kDefaultWorkerCount = 4;
 constexpr std::size_t kDefaultQueueSize = 20;
+constexpr std::size_t kDefaultCacheSize = 1024 * 1024;
 constexpr const char* kFileNotFoundMessage = "ERROR: file not found";
 
 volatile std::sig_atomic_t g_stop_requested = 0;
+
+enum class SchedulingPolicy {
+    Fifo,
+    Sff,
+};
 
 struct ServerConfig {
     int port = 0;
     int worker_count = kDefaultWorkerCount;
     std::size_t queue_size = kDefaultQueueSize;
+    SchedulingPolicy policy = SchedulingPolicy::Fifo;
+    bool cache_enabled = true;
+    std::size_t cache_size_bytes = kDefaultCacheSize;
 };
 
 struct Request {
@@ -39,33 +49,51 @@ struct Request {
     std::string client_address;
     std::chrono::steady_clock::time_point arrival_timestamp;
     std::size_t file_size_estimate = 0;
+    std::size_t sequence_number = 0;
 };
 
 class RequestQueue {
 public:
-    explicit RequestQueue(std::size_t max_size) : max_size_(max_size) {}
+    RequestQueue(std::size_t max_size, SchedulingPolicy policy)
+        : max_size_(max_size), policy_(policy) {}
 
     void push(Request request) {
         std::unique_lock<std::mutex> lock(mutex_);
-        not_full_.wait(lock, [&] { return shutdown_ || queue_.size() < max_size_; });
+        not_full_.wait(lock, [&] { return shutdown_ || requests_.size() < max_size_; });
         if (shutdown_) {
             close(request.client_socket_fd);
             return;
         }
 
-        queue_.push(std::move(request));
+        requests_.push_back(std::move(request));
         not_empty_.notify_one();
     }
 
     std::optional<Request> pop() {
         std::unique_lock<std::mutex> lock(mutex_);
-        not_empty_.wait(lock, [&] { return shutdown_ || !queue_.empty(); });
-        if (queue_.empty()) {
+        not_empty_.wait(lock, [&] { return shutdown_ || !requests_.empty(); });
+        if (requests_.empty()) {
             return std::nullopt;
         }
 
-        Request request = std::move(queue_.front());
-        queue_.pop();
+        Request request;
+        if (policy_ == SchedulingPolicy::Fifo) {
+            request = std::move(requests_.front());
+            requests_.pop_front();
+        } else {
+            auto next_request = requests_.begin();
+            for (auto it = std::next(requests_.begin()); it != requests_.end(); ++it) {
+                if (it->file_size_estimate < next_request->file_size_estimate ||
+                    (it->file_size_estimate == next_request->file_size_estimate &&
+                     it->sequence_number < next_request->sequence_number)) {
+                    next_request = it;
+                }
+            }
+
+            request = std::move(*next_request);
+            requests_.erase(next_request);
+        }
+
         not_full_.notify_one();
         return request;
     }
@@ -79,11 +107,94 @@ public:
 
 private:
     std::size_t max_size_;
-    std::queue<Request> queue_;
+    SchedulingPolicy policy_;
+    std::deque<Request> requests_;
     bool shutdown_ = false;
     std::mutex mutex_;
     std::condition_variable not_empty_;
     std::condition_variable not_full_;
+};
+
+class FileCache {
+public:
+    struct LookupResult {
+        std::vector<char> data;
+        bool hit = false;
+    };
+
+    FileCache(bool enabled, std::size_t max_bytes) : enabled_(enabled), max_bytes_(max_bytes) {}
+
+    LookupResult get(const std::string& filename) {
+        if (!enabled_) {
+            return {};
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto entry = entries_.find(filename);
+        if (entry == entries_.end()) {
+            return {};
+        }
+
+        touch(entry);
+        return {entry->second.data, true};
+    }
+
+    void put(const std::string& filename, const std::vector<char>& data) {
+        if (!enabled_ || data.size() > max_bytes_) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto existing = entries_.find(filename);
+        if (existing != entries_.end()) {
+            current_bytes_ -= existing->second.size;
+            lru_order_.erase(existing->second.lru_position);
+            entries_.erase(existing);
+        }
+
+        while (!lru_order_.empty() && current_bytes_ + data.size() > max_bytes_) {
+            evict_one();
+        }
+
+        lru_order_.push_front(filename);
+        CacheEntry entry;
+        entry.data = data;
+        entry.size = data.size();
+        entry.lru_position = lru_order_.begin();
+        entries_.emplace(filename, std::move(entry));
+        current_bytes_ += data.size();
+    }
+
+private:
+    struct CacheEntry {
+        std::vector<char> data;
+        std::list<std::string>::iterator lru_position;
+        std::size_t size = 0;
+    };
+
+    using EntryMap = std::unordered_map<std::string, CacheEntry>;
+
+    void touch(EntryMap::iterator entry) {
+        lru_order_.splice(lru_order_.begin(), lru_order_, entry->second.lru_position);
+        entry->second.lru_position = lru_order_.begin();
+    }
+
+    void evict_one() {
+        const std::string& filename = lru_order_.back();
+        auto entry = entries_.find(filename);
+        if (entry != entries_.end()) {
+            current_bytes_ -= entry->second.size;
+            entries_.erase(entry);
+        }
+        lru_order_.pop_back();
+    }
+
+    bool enabled_;
+    std::size_t max_bytes_;
+    std::size_t current_bytes_ = 0;
+    std::list<std::string> lru_order_;
+    EntryMap entries_;
+    std::mutex mutex_;
 };
 
 bool send_all(int socket_fd, const char* data, std::size_t length) {
@@ -114,13 +225,43 @@ std::string make_client_address(const sockaddr_in& client_addr) {
     return std::string(client_ip) + ":" + std::to_string(ntohs(client_addr.sin_port));
 }
 
+std::string policy_to_string(SchedulingPolicy policy) {
+    return policy == SchedulingPolicy::Fifo ? "fifo" : "sff";
+}
+
+std::optional<std::vector<char>> read_file_contents(const std::string& filename) {
+    std::ifstream input_file(filename, std::ios::binary);
+    if (!input_file.is_open()) {
+        return std::nullopt;
+    }
+
+    input_file.seekg(0, std::ios::end);
+    const std::streamoff file_size = input_file.tellg();
+    if (file_size < 0) {
+        return std::nullopt;
+    }
+
+    input_file.seekg(0, std::ios::beg);
+    std::vector<char> data(static_cast<std::size_t>(file_size));
+    if (!data.empty()) {
+        input_file.read(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!input_file) {
+            return std::nullopt;
+        }
+    }
+
+    return data;
+}
+
 void handle_signal(int) {
     g_stop_requested = 1;
 }
 
 ServerConfig parse_arguments(int argc, char* argv[]) {
     if (argc < 2) {
-        throw std::runtime_error("Usage: ./server <port> [--workers <n>] [--queue <size>]");
+        throw std::runtime_error(
+            "Usage: ./server <port> [--workers <n>] [--queue <size>] "
+            "[--policy fifo|sff] [--cache-size <bytes>] [--cache off]");
     }
 
     ServerConfig config;
@@ -132,6 +273,25 @@ ServerConfig parse_arguments(int argc, char* argv[]) {
             config.worker_count = std::stoi(argv[++i]);
         } else if (arg == "--queue" && i + 1 < argc) {
             config.queue_size = static_cast<std::size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--policy" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "fifo") {
+                config.policy = SchedulingPolicy::Fifo;
+            } else if (value == "sff") {
+                config.policy = SchedulingPolicy::Sff;
+            } else {
+                throw std::runtime_error("Policy must be 'fifo' or 'sff'");
+            }
+        } else if (arg == "--cache-size" && i + 1 < argc) {
+            config.cache_size_bytes = static_cast<std::size_t>(std::stoull(argv[++i]));
+            config.cache_enabled = true;
+        } else if (arg == "--cache" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "off") {
+                config.cache_enabled = false;
+            } else {
+                throw std::runtime_error("Cache option only supports '--cache off'");
+            }
         } else {
             throw std::runtime_error("Unknown or incomplete argument: " + arg);
         }
@@ -146,51 +306,60 @@ ServerConfig parse_arguments(int argc, char* argv[]) {
     if (config.queue_size == 0) {
         throw std::runtime_error("Queue size must be positive");
     }
+    if (config.cache_enabled && config.cache_size_bytes == 0) {
+        throw std::runtime_error("Cache size must be positive when cache is enabled");
+    }
 
     return config;
 }
 
-void serve_request(const Request& request, int worker_id) {
+void serve_request(const Request& request, int worker_id, FileCache& file_cache) {
     std::cout << "Worker " << worker_id << " serving " << request.filename
               << " for " << request.client_address << std::endl;
 
-    std::ifstream input_file(request.filename, std::ios::binary);
-    if (!input_file.is_open()) {
-        std::cerr << "File not found: " << request.filename << std::endl;
-        if (!send_all(request.client_socket_fd,
-                      kFileNotFoundMessage,
-                      std::strlen(kFileNotFoundMessage))) {
-            std::cerr << "Failed to send error message" << std::endl;
+    std::vector<char> file_data;
+    const FileCache::LookupResult cache_result = file_cache.get(request.filename);
+    if (cache_result.hit) {
+        file_data = cache_result.data;
+    } else {
+        std::optional<std::vector<char>> loaded_file = read_file_contents(request.filename);
+        if (!loaded_file.has_value()) {
+            std::cerr << "File not found: " << request.filename << std::endl;
+            if (!send_all(request.client_socket_fd,
+                          kFileNotFoundMessage,
+                          std::strlen(kFileNotFoundMessage))) {
+                std::cerr << "Failed to send error message" << std::endl;
+            }
+            close(request.client_socket_fd);
+            return;
         }
+
+        file_data = std::move(*loaded_file);
+        file_cache.put(request.filename, file_data);
+    }
+
+    if (!file_data.empty() &&
+        !send_all(request.client_socket_fd, file_data.data(), file_data.size())) {
+        std::cerr << "Failed while sending file contents" << std::endl;
         close(request.client_socket_fd);
         return;
     }
 
-    char buffer[kBufferSize];
-    while (input_file.good()) {
-        input_file.read(buffer, sizeof(buffer));
-        const std::streamsize bytes_read = input_file.gcount();
-        if (bytes_read <= 0) {
-            break;
-        }
-
-        if (!send_all(request.client_socket_fd, buffer, static_cast<std::size_t>(bytes_read))) {
-            std::cerr << "Failed while sending file contents" << std::endl;
-            close(request.client_socket_fd);
-            return;
-        }
+    if (file_data.empty()) {
+        close(request.client_socket_fd);
+        return;
     }
 
     close(request.client_socket_fd);
 }
 
-void worker_loop(int worker_id, RequestQueue& request_queue) {
+void worker_loop(int worker_id, RequestQueue& request_queue, FileCache& file_cache) {
     while (true) {
         std::optional<Request> request = request_queue.pop();
         if (!request.has_value()) {
             return;
         }
-        serve_request(*request, worker_id);
+        serve_request(*request, worker_id, file_cache);
     }
 }
 
@@ -236,17 +405,24 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        RequestQueue request_queue(config.queue_size);
+        RequestQueue request_queue(config.queue_size, config.policy);
+        FileCache file_cache(config.cache_enabled, config.cache_size_bytes);
         std::vector<std::thread> workers;
         workers.reserve(static_cast<std::size_t>(config.worker_count));
         for (int worker_id = 0; worker_id < config.worker_count; ++worker_id) {
-            workers.emplace_back(worker_loop, worker_id, std::ref(request_queue));
+            workers.emplace_back(worker_loop, worker_id, std::ref(request_queue), std::ref(file_cache));
         }
 
         std::cout << "Server listening on port " << config.port
                   << " with workers=" << config.worker_count
-                  << " and queue=" << config.queue_size << std::endl;
+                  << " queue=" << config.queue_size
+                  << " policy=" << policy_to_string(config.policy)
+                  << " cache="
+                  << (config.cache_enabled ? std::to_string(config.cache_size_bytes) + " bytes"
+                                           : std::string("off"))
+                  << std::endl;
 
+        std::size_t request_sequence = 0;
         while (!g_stop_requested) {
             sockaddr_in client_addr {};
             socklen_t client_addr_len = sizeof(client_addr);
@@ -275,6 +451,7 @@ int main(int argc, char* argv[]) {
             request.client_address = make_client_address(client_addr);
             request.arrival_timestamp = std::chrono::steady_clock::now();
             request.file_size_estimate = estimate_file_size(request.filename);
+            request.sequence_number = request_sequence++;
 
             request_queue.push(std::move(request));
         }

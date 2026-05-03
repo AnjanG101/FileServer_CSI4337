@@ -1,6 +1,6 @@
 # FileServer_CSI4337
 
-This project is a TCP file transfer system in C++ for Linux. The client sends a filename and the server replies with the file contents or `ERROR: file not found`. The server runs continuously and can serve multiple clients through a bounded producer-consumer queue and a fixed worker thread pool.
+This project is a TCP file transfer system in C++ for Linux. The client sends a filename and the server replies with the file contents or `ERROR: file not found`. The server runs continuously, uses a bounded producer-consumer queue with worker threads, supports selectable request scheduling, and can keep recently requested files in an in-memory LRU cache.
 
 ## Current Scope
 
@@ -9,18 +9,18 @@ This project is a TCP file transfer system in C++ for Linux. The client sends a 
 - Bounded blocking request queue
 - Fixed worker thread pool
 - Configurable `--workers` and `--queue` options
+- Runtime-selectable scheduling policy: FIFO or shortest-file-first
+- Optional bounded in-memory LRU file cache
 - Continuous server operation until interrupted
 
 Not included yet:
 
-- Scheduling policies beyond FIFO queue order
-- Caching
 - Request logging
 - Benchmark tooling
 
 ## Files
 
-- `server.cpp`: Multithreaded TCP server with a bounded blocking request queue and worker threads
+- `server.cpp`: Multithreaded TCP server with scheduling and caching support
 - `client.cpp`: Connects to the server, sends a filename, and prints the response to stdout
 - `Makefile`: Builds both executables
 
@@ -55,7 +55,8 @@ Start the server:
 Optional arguments:
 
 ```bash
-./server <port> --workers <n> --queue <size>
+./server <port> --workers <n> --queue <size> --policy <fifo|sff> --cache-size <bytes>
+./server <port> --cache off
 ```
 
 Example:
@@ -63,7 +64,19 @@ Example:
 ```bash
 ./server 8080
 ./server 8080 --workers 4 --queue 20
+./server 8080 --workers 4 --queue 20 --policy fifo
+./server 8080 --workers 4 --queue 20 --policy sff
+./server 8080 --workers 4 --queue 20 --policy fifo --cache-size 1048576
+./server 8080 --cache off
 ```
+
+Defaults:
+
+- `workers = 4`
+- `queue size = 20`
+- `policy = fifo`
+- `cache = enabled`
+- `cache size = 1048576` bytes
 
 Run the client from another terminal:
 
@@ -102,7 +115,23 @@ Queue behavior:
 
 - If the queue is full, the acceptor blocks until a worker removes a request
 - If the queue is empty, workers block until a request is available
-- Requests are served in FIFO queue order
+
+Scheduling behavior:
+
+- `fifo`: requests are served in arrival order
+- `sff`: the next request chosen is the one with the smallest file size estimate
+- Missing files are estimated as size `0`, so they are handled cleanly under either policy
+
+## Cache Behavior
+
+- The server can keep file contents in memory using a bounded LRU cache
+- On each request, workers first check the cache before reading from disk
+- Cache hits send the stored contents directly
+- Cache misses read the file from disk and insert it into the cache if it fits
+- Missing files are never cached
+- The cache is protected by a mutex so concurrent workers do not corrupt its state
+
+Use `--cache-size <bytes>` to change the cache capacity or `--cache off` to disable caching entirely.
 
 ## Manual Testing
 
@@ -124,7 +153,13 @@ Terminal 2:
 ./client 127.0.0.1 8080 test.txt
 ```
 
-Open more client terminals and request files concurrently to observe multiple workers serving requests.
+Additional checks:
+
+- Request a missing file and verify the client prints `ERROR: file not found`
+- Open multiple client terminals at once to observe concurrent service
+- Run the server with `--policy fifo` and `--policy sff` to compare request ordering
+- Request the same large file repeatedly with cache enabled to exercise cache reuse
+- Run once with `--cache-size 1048576` and once with `--cache off` to compare cached vs direct-disk behavior
 
 ## Socket APIs Used
 
