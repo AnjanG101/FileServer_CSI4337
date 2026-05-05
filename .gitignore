@@ -7,12 +7,15 @@ server_manual_check
 client_manual_check
 *.o
 *.out
+server.log
 
 # Local test files
 test.txt
+big.txt
 
 # Editor and OS clutter
 *.swp
 *.swo
 *~
 .DS_Store
+__pycache__/

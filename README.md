@@ -1,27 +1,13 @@
 # FileServer_CSI4337
 
-This project is a TCP file transfer system in C++ for Linux. The client sends a filename and the server replies with the file contents or `ERROR: file not found`. The server runs continuously, uses a bounded producer-consumer queue with worker threads, supports selectable request scheduling, and can keep recently requested files in an in-memory LRU cache.
-
-## Current Scope
-
-- Multiple client connections
-- Main accept loop acts as the producer
-- Bounded blocking request queue
-- Fixed worker thread pool
-- Configurable `--workers` and `--queue` options
-- Runtime-selectable scheduling policy: FIFO or shortest-file-first
-- Optional bounded in-memory LRU file cache
-- Continuous server operation until interrupted
-
-Not included yet:
-
-- Request logging
-- Benchmark tooling
+This project is a multithreaded TCP file transfer system in C++ for Linux. The client sends a filename and the server replies with the file contents or `ERROR: file not found`. The server uses a bounded producer-consumer request queue, a worker thread pool, runtime-selectable scheduling, an in-memory LRU cache, and thread-safe request logging.
 
 ## Files
 
-- `server.cpp`: Multithreaded TCP server with scheduling and caching support
+- `server.cpp`: Multithreaded TCP server with queueing, scheduling, caching, and logging
 - `client.cpp`: Connects to the server, sends a filename, and prints the response to stdout
+- `benchmark.py`: Concurrent benchmark tool for measuring throughput and response time
+- `test.txt`, `big.txt`: Sample files for manual testing
 - `Makefile`: Builds both executables
 
 ## Build
@@ -40,8 +26,8 @@ This produces:
 The code also compiles with:
 
 ```bash
-g++ -std=c++17 server.cpp -o server
-g++ -std=c++17 client.cpp -o client
+g++ -std=c++17 -pthread server.cpp -o server
+g++ -std=c++17 -pthread client.cpp -o client
 ```
 
 ## Run
@@ -90,50 +76,59 @@ Example:
 ./client 127.0.0.1 8080 test.txt
 ```
 
-## Expected Behavior
+## Overview
 
-- If the file exists, the client prints the file contents
-- If the file does not exist, the client prints:
+- The accept loop receives client connections and acts as the producer
+- Each request stores the socket fd, filename, client address, arrival time, and file size estimate
+- The bounded queue blocks the acceptor when full and blocks workers when empty
+- Worker threads pop requests and send file contents back to the client
+- The server continues running until interrupted with `Ctrl+C`
+
+If the file exists, the client prints the contents. If the file does not exist, the client prints:
 
 ```text
 ERROR: file not found
 ```
 
-Each client connection is handled by a worker thread after the request is placed into the bounded queue. The server stays running until stopped with `Ctrl+C`.
+## Scheduling
 
-## Request Handling Model
+- `fifo`: serve requests in arrival order
+- `sff`: choose the queued request with the smallest file size estimate first
+- Missing files are estimated as size `0`, so they are still handled cleanly under either policy
 
-Each accepted request stores:
+## Cache
 
-- Client socket file descriptor
-- Requested filename
-- Client address string
-- Request arrival timestamp
-- File size estimate
-
-Queue behavior:
-
-- If the queue is full, the acceptor blocks until a worker removes a request
-- If the queue is empty, workers block until a request is available
-
-Scheduling behavior:
-
-- `fifo`: requests are served in arrival order
-- `sff`: the next request chosen is the one with the smallest file size estimate
-- Missing files are estimated as size `0`, so they are handled cleanly under either policy
-
-## Cache Behavior
-
-- The server can keep file contents in memory using a bounded LRU cache
-- On each request, workers first check the cache before reading from disk
-- Cache hits send the stored contents directly
-- Cache misses read the file from disk and insert it into the cache if it fits
+- The server keeps file contents in a bounded in-memory LRU cache when caching is enabled
+- Workers check the cache before reading from disk
+- Cache hits send the stored bytes directly
+- Cache misses load the file from disk and insert it if the file fits within the cache capacity
 - Missing files are never cached
-- The cache is protected by a mutex so concurrent workers do not corrupt its state
+- The cache is protected by a mutex so multiple workers can use it safely
 
 Use `--cache-size <bytes>` to change the cache capacity or `--cache off` to disable caching entirely.
 
-## Manual Testing
+## Logging
+
+Each completed request appends a line to `server.log` with:
+
+- Timestamp
+- Client address
+- Filename
+- Scheduling policy
+- Worker thread id
+- Cache hit or miss
+- Success or error status
+- Response time in milliseconds
+
+Example:
+
+```text
+2026-05-01 13:42:10 | client=127.0.0.1:51432 | file=test.txt | policy=fifo | worker=2 | cache=miss | status=success | response_ms=4.72
+```
+
+Log writes are protected by a mutex so lines are not interleaved under concurrent load.
+
+## Testing
 
 Build:
 
@@ -155,11 +150,58 @@ Terminal 2:
 
 Additional checks:
 
-- Request a missing file and verify the client prints `ERROR: file not found`
-- Open multiple client terminals at once to observe concurrent service
-- Run the server with `--policy fifo` and `--policy sff` to compare request ordering
-- Request the same large file repeatedly with cache enabled to exercise cache reuse
-- Run once with `--cache-size 1048576` and once with `--cache off` to compare cached vs direct-disk behavior
+- Valid file:
+```bash
+./client 127.0.0.1 8080 test.txt
+```
+- Missing file:
+```bash
+./client 127.0.0.1 8080 missing.txt
+```
+- Multiple clients:
+```bash
+./client 127.0.0.1 8080 test.txt &
+./client 127.0.0.1 8080 big.txt &
+./client 127.0.0.1 8080 test.txt &
+wait
+```
+- Repeated same file for cache hits:
+```bash
+./client 127.0.0.1 8080 big.txt
+./client 127.0.0.1 8080 big.txt
+tail -n 5 server.log
+```
+- FIFO vs SFF:
+Run once with `--policy fifo` and once with `--policy sff`, then send a mix of `test.txt` and `big.txt` requests.
+- Cache on vs off:
+Run once with `--cache-size 1048576` and once with `--cache off`, then compare `server.log` cache fields and benchmark throughput.
+- Different worker counts:
+Restart the server with values such as `--workers 1`, `--workers 4`, and `--workers 8` and compare response times.
+
+## Benchmark
+
+Example:
+
+```bash
+python3 benchmark.py --host 127.0.0.1 --port 8080 --requests 100 --concurrency 10 --files test.txt big.txt
+```
+
+The script reports:
+
+- Total benchmark time
+- Average response time
+- Throughput in requests per second
+- Total bytes received
+- Number of completed and failed requests
+
+Cache hit rate can be estimated afterward by inspecting `server.log`.
+
+## Known Limitations
+
+- The server expects the client to send only the filename as raw bytes in a single request
+- File paths are interpreted relative to the server's current working directory
+- The current protocol does not send file metadata such as length, content type, or explicit status codes
+- The shortest-file-first policy uses `stat()` as a best-effort size estimate before service
 
 ## Socket APIs Used
 

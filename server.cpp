@@ -5,12 +5,15 @@
 #include <csignal>
 #include <cstring>
 #include <deque>
+#include <iomanip>
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <sstream>
 #include <mutex>
 #include <netinet/in.h>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <sys/socket.h>
@@ -51,6 +54,8 @@ struct Request {
     std::size_t file_size_estimate = 0;
     std::size_t sequence_number = 0;
 };
+
+std::string policy_to_string(SchedulingPolicy policy);
 
 class RequestQueue {
 public:
@@ -197,6 +202,45 @@ private:
     std::mutex mutex_;
 };
 
+class ServerLogger {
+public:
+    explicit ServerLogger(const std::string& path) : output_(path, std::ios::app) {
+        if (!output_.is_open()) {
+            throw std::runtime_error("Failed to open log file: " + path);
+        }
+    }
+
+    void log_request(const Request& request,
+                     SchedulingPolicy policy,
+                     int worker_id,
+                     const std::string& cache_state,
+                     const std::string& status,
+                     double response_ms) {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        std::tm timestamp {};
+        localtime_r(&now_time, &timestamp);
+
+        std::ostringstream line;
+        line << std::put_time(&timestamp, "%Y-%m-%d %H:%M:%S")
+             << " | client=" << request.client_address
+             << " | file=" << request.filename
+             << " | policy=" << policy_to_string(policy)
+             << " | worker=" << worker_id
+             << " | cache=" << cache_state
+             << " | status=" << status
+             << " | response_ms=" << std::fixed << std::setprecision(2) << response_ms;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        output_ << line.str() << '\n';
+        output_.flush();
+    }
+
+private:
+    std::ofstream output_;
+    std::mutex mutex_;
+};
+
 bool send_all(int socket_fd, const char* data, std::size_t length) {
     std::size_t total_sent = 0;
 
@@ -251,6 +295,11 @@ std::optional<std::vector<char>> read_file_contents(const std::string& filename)
     }
 
     return data;
+}
+
+double elapsed_milliseconds(std::chrono::steady_clock::time_point start_time) {
+    const auto elapsed = std::chrono::steady_clock::now() - start_time;
+    return std::chrono::duration<double, std::milli>(elapsed).count();
 }
 
 void handle_signal(int) {
@@ -313,23 +362,35 @@ ServerConfig parse_arguments(int argc, char* argv[]) {
     return config;
 }
 
-void serve_request(const Request& request, int worker_id, FileCache& file_cache) {
+void serve_request(const Request& request,
+                   int worker_id,
+                   SchedulingPolicy policy,
+                   FileCache& file_cache,
+                   ServerLogger& logger) {
     std::cout << "Worker " << worker_id << " serving " << request.filename
               << " for " << request.client_address << std::endl;
 
     std::vector<char> file_data;
+    std::string cache_state = "miss";
     const FileCache::LookupResult cache_result = file_cache.get(request.filename);
     if (cache_result.hit) {
         file_data = cache_result.data;
+        cache_state = "hit";
     } else {
         std::optional<std::vector<char>> loaded_file = read_file_contents(request.filename);
         if (!loaded_file.has_value()) {
             std::cerr << "File not found: " << request.filename << std::endl;
-            if (!send_all(request.client_socket_fd,
-                          kFileNotFoundMessage,
-                          std::strlen(kFileNotFoundMessage))) {
+            const bool sent_error =
+                send_all(request.client_socket_fd, kFileNotFoundMessage, std::strlen(kFileNotFoundMessage));
+            if (!sent_error) {
                 std::cerr << "Failed to send error message" << std::endl;
             }
+            logger.log_request(request,
+                               policy,
+                               worker_id,
+                               cache_state,
+                               "error",
+                               elapsed_milliseconds(request.arrival_timestamp));
             close(request.client_socket_fd);
             return;
         }
@@ -341,9 +402,18 @@ void serve_request(const Request& request, int worker_id, FileCache& file_cache)
     if (!file_data.empty() &&
         !send_all(request.client_socket_fd, file_data.data(), file_data.size())) {
         std::cerr << "Failed while sending file contents" << std::endl;
+        logger.log_request(request,
+                           policy,
+                           worker_id,
+                           cache_state,
+                           "error",
+                           elapsed_milliseconds(request.arrival_timestamp));
         close(request.client_socket_fd);
         return;
     }
+
+    logger.log_request(
+        request, policy, worker_id, cache_state, "success", elapsed_milliseconds(request.arrival_timestamp));
 
     if (file_data.empty()) {
         close(request.client_socket_fd);
@@ -353,13 +423,17 @@ void serve_request(const Request& request, int worker_id, FileCache& file_cache)
     close(request.client_socket_fd);
 }
 
-void worker_loop(int worker_id, RequestQueue& request_queue, FileCache& file_cache) {
+void worker_loop(int worker_id,
+                 SchedulingPolicy policy,
+                 RequestQueue& request_queue,
+                 FileCache& file_cache,
+                 ServerLogger& logger) {
     while (true) {
         std::optional<Request> request = request_queue.pop();
         if (!request.has_value()) {
             return;
         }
-        serve_request(*request, worker_id, file_cache);
+        serve_request(*request, worker_id, policy, file_cache, logger);
     }
 }
 
@@ -407,10 +481,16 @@ int main(int argc, char* argv[]) {
 
         RequestQueue request_queue(config.queue_size, config.policy);
         FileCache file_cache(config.cache_enabled, config.cache_size_bytes);
+        ServerLogger logger("server.log");
         std::vector<std::thread> workers;
         workers.reserve(static_cast<std::size_t>(config.worker_count));
         for (int worker_id = 0; worker_id < config.worker_count; ++worker_id) {
-            workers.emplace_back(worker_loop, worker_id, std::ref(request_queue), std::ref(file_cache));
+            workers.emplace_back(worker_loop,
+                                 worker_id,
+                                 config.policy,
+                                 std::ref(request_queue),
+                                 std::ref(file_cache),
+                                 std::ref(logger));
         }
 
         std::cout << "Server listening on port " << config.port
