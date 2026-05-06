@@ -1,21 +1,23 @@
+//Author: Brandon Liu
+//File: src/server.cpp
+//Description: Implementation of a multi-threaded file server that listens for incoming connections, 
+//processes file requests using a configurable scheduling policy, and optionally caches file contents in memory to improve performance.
+
+#include "file_cache.h"
+#include "request_queue.h"
+#include "server_logger.h"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <csignal>
 #include <cstring>
-#include <deque>
-#include <iomanip>
 #include <fstream>
 #include <iostream>
-#include <list>
-#include <sstream>
-#include <mutex>
 #include <netinet/in.h>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
@@ -28,14 +30,10 @@ constexpr std::size_t kMaxFilenameSize = 1024;
 constexpr int kDefaultWorkerCount = 4;
 constexpr std::size_t kDefaultQueueSize = 20;
 constexpr std::size_t kDefaultCacheSize = 1024 * 1024;
+constexpr const char* kServerFilesDirectory = "server_files/";
 constexpr const char* kFileNotFoundMessage = "ERROR: file not found";
 
 volatile std::sig_atomic_t g_stop_requested = 0;
-
-enum class SchedulingPolicy {
-    Fifo,
-    Sff,
-};
 
 struct ServerConfig {
     int port = 0;
@@ -44,201 +42,6 @@ struct ServerConfig {
     SchedulingPolicy policy = SchedulingPolicy::Fifo;
     bool cache_enabled = true;
     std::size_t cache_size_bytes = kDefaultCacheSize;
-};
-
-struct Request {
-    int client_socket_fd = -1;
-    std::string filename;
-    std::string client_address;
-    std::chrono::steady_clock::time_point arrival_timestamp;
-    std::size_t file_size_estimate = 0;
-    std::size_t sequence_number = 0;
-};
-
-std::string policy_to_string(SchedulingPolicy policy);
-
-class RequestQueue {
-public:
-    RequestQueue(std::size_t max_size, SchedulingPolicy policy)
-        : max_size_(max_size), policy_(policy) {}
-
-    void push(Request request) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        not_full_.wait(lock, [&] { return shutdown_ || requests_.size() < max_size_; });
-        if (shutdown_) {
-            close(request.client_socket_fd);
-            return;
-        }
-
-        requests_.push_back(std::move(request));
-        not_empty_.notify_one();
-    }
-
-    std::optional<Request> pop() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        not_empty_.wait(lock, [&] { return shutdown_ || !requests_.empty(); });
-        if (requests_.empty()) {
-            return std::nullopt;
-        }
-
-        Request request;
-        if (policy_ == SchedulingPolicy::Fifo) {
-            request = std::move(requests_.front());
-            requests_.pop_front();
-        } else {
-            auto next_request = requests_.begin();
-            for (auto it = std::next(requests_.begin()); it != requests_.end(); ++it) {
-                if (it->file_size_estimate < next_request->file_size_estimate ||
-                    (it->file_size_estimate == next_request->file_size_estimate &&
-                     it->sequence_number < next_request->sequence_number)) {
-                    next_request = it;
-                }
-            }
-
-            request = std::move(*next_request);
-            requests_.erase(next_request);
-        }
-
-        not_full_.notify_one();
-        return request;
-    }
-
-    void shutdown() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        shutdown_ = true;
-        not_empty_.notify_all();
-        not_full_.notify_all();
-    }
-
-private:
-    std::size_t max_size_;
-    SchedulingPolicy policy_;
-    std::deque<Request> requests_;
-    bool shutdown_ = false;
-    std::mutex mutex_;
-    std::condition_variable not_empty_;
-    std::condition_variable not_full_;
-};
-
-class FileCache {
-public:
-    struct LookupResult {
-        std::vector<char> data;
-        bool hit = false;
-    };
-
-    FileCache(bool enabled, std::size_t max_bytes) : enabled_(enabled), max_bytes_(max_bytes) {}
-
-    LookupResult get(const std::string& filename) {
-        if (!enabled_) {
-            return {};
-        }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto entry = entries_.find(filename);
-        if (entry == entries_.end()) {
-            return {};
-        }
-
-        touch(entry);
-        return {entry->second.data, true};
-    }
-
-    void put(const std::string& filename, const std::vector<char>& data) {
-        if (!enabled_ || data.size() > max_bytes_) {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto existing = entries_.find(filename);
-        if (existing != entries_.end()) {
-            current_bytes_ -= existing->second.size;
-            lru_order_.erase(existing->second.lru_position);
-            entries_.erase(existing);
-        }
-
-        while (!lru_order_.empty() && current_bytes_ + data.size() > max_bytes_) {
-            evict_one();
-        }
-
-        lru_order_.push_front(filename);
-        CacheEntry entry;
-        entry.data = data;
-        entry.size = data.size();
-        entry.lru_position = lru_order_.begin();
-        entries_.emplace(filename, std::move(entry));
-        current_bytes_ += data.size();
-    }
-
-private:
-    struct CacheEntry {
-        std::vector<char> data;
-        std::list<std::string>::iterator lru_position;
-        std::size_t size = 0;
-    };
-
-    using EntryMap = std::unordered_map<std::string, CacheEntry>;
-
-    void touch(EntryMap::iterator entry) {
-        lru_order_.splice(lru_order_.begin(), lru_order_, entry->second.lru_position);
-        entry->second.lru_position = lru_order_.begin();
-    }
-
-    void evict_one() {
-        const std::string& filename = lru_order_.back();
-        auto entry = entries_.find(filename);
-        if (entry != entries_.end()) {
-            current_bytes_ -= entry->second.size;
-            entries_.erase(entry);
-        }
-        lru_order_.pop_back();
-    }
-
-    bool enabled_;
-    std::size_t max_bytes_;
-    std::size_t current_bytes_ = 0;
-    std::list<std::string> lru_order_;
-    EntryMap entries_;
-    std::mutex mutex_;
-};
-
-class ServerLogger {
-public:
-    explicit ServerLogger(const std::string& path) : output_(path, std::ios::app) {
-        if (!output_.is_open()) {
-            throw std::runtime_error("Failed to open log file: " + path);
-        }
-    }
-
-    void log_request(const Request& request,
-                     SchedulingPolicy policy,
-                     int worker_id,
-                     const std::string& cache_state,
-                     const std::string& status,
-                     double response_ms) {
-        const auto now = std::chrono::system_clock::now();
-        const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-        std::tm timestamp {};
-        localtime_r(&now_time, &timestamp);
-
-        std::ostringstream line;
-        line << std::put_time(&timestamp, "%Y-%m-%d %H:%M:%S")
-             << " | client=" << request.client_address
-             << " | file=" << request.filename
-             << " | policy=" << policy_to_string(policy)
-             << " | worker=" << worker_id
-             << " | cache=" << cache_state
-             << " | status=" << status
-             << " | response_ms=" << std::fixed << std::setprecision(2) << response_ms;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        output_ << line.str() << '\n';
-        output_.flush();
-    }
-
-private:
-    std::ofstream output_;
-    std::mutex mutex_;
 };
 
 bool send_all(int socket_fd, const char* data, std::size_t length) {
@@ -257,7 +60,8 @@ bool send_all(int socket_fd, const char* data, std::size_t length) {
 
 std::size_t estimate_file_size(const std::string& filename) {
     struct stat file_info {};
-    if (stat(filename.c_str(), &file_info) == 0 && S_ISREG(file_info.st_mode)) {
+    const std::string file_path = std::string(kServerFilesDirectory) + filename;
+    if (stat(file_path.c_str(), &file_info) == 0 && S_ISREG(file_info.st_mode)) {
         return static_cast<std::size_t>(file_info.st_size);
     }
     return 0;
@@ -267,10 +71,6 @@ std::string make_client_address(const sockaddr_in& client_addr) {
     char client_ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
     return std::string(client_ip) + ":" + std::to_string(ntohs(client_addr.sin_port));
-}
-
-std::string policy_to_string(SchedulingPolicy policy) {
-    return policy == SchedulingPolicy::Fifo ? "fifo" : "sff";
 }
 
 std::optional<std::vector<char>> read_file_contents(const std::string& filename) {
@@ -377,7 +177,8 @@ void serve_request(const Request& request,
         file_data = cache_result.data;
         cache_state = "hit";
     } else {
-        std::optional<std::vector<char>> loaded_file = read_file_contents(request.filename);
+        const std::string file_path = std::string(kServerFilesDirectory) + request.filename;
+        std::optional<std::vector<char>> loaded_file = read_file_contents(file_path);
         if (!loaded_file.has_value()) {
             std::cerr << "File not found: " << request.filename << std::endl;
             const bool sent_error =
@@ -437,7 +238,7 @@ void worker_loop(int worker_id,
     }
 }
 
-}  // namespace
+}
 
 int main(int argc, char* argv[]) {
     try {

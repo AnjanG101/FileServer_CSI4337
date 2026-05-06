@@ -1,3 +1,7 @@
+//Author: Brandon Liu
+//File: src/client.cpp
+//Description: Implementation of a simple client that connects to the file server, sends a filename,
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -25,7 +29,7 @@ bool send_all(int socket_fd, const char* data, std::size_t length) {
     return true;
 }
 
-}  // namespace
+}
 
 int main(int argc, char* argv[]) {
     if (argc != 4) {

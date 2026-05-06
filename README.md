@@ -4,10 +4,14 @@ This project is a multithreaded TCP file transfer system in C++ for Linux. The c
 
 ## Files
 
-- `server.cpp`: Multithreaded TCP server with queueing, scheduling, caching, and logging
-- `client.cpp`: Connects to the server, sends a filename, and prints the response to stdout
+- `src/server.cpp`: Multithreaded TCP server with queueing, scheduling, caching, and logging
+- `src/client.cpp`: Connects to the server, sends a filename, and prints the response to stdout
+- `src/request_queue.*`: Shared request types, scheduling policy support, and bounded queue
+- `src/file_cache.*`: Bounded in-memory LRU cache
+- `src/server_logger.*`: Thread-safe request logging
 - `benchmark.py`: Concurrent benchmark tool for measuring throughput and response time
-- `test.txt`, `big.txt`: Sample files for manual testing
+- `server_files/`: Files that the server is allowed to serve
+- `server_files/test.txt`, `server_files/big.txt`: Sample files for manual testing
 - `Makefile`: Builds both executables
 
 ## Build
@@ -26,8 +30,8 @@ This produces:
 The code also compiles with:
 
 ```bash
-g++ -std=c++17 -pthread server.cpp -o server
-g++ -std=c++17 -pthread client.cpp -o client
+g++ -std=c++17 -pthread src/server.cpp src/request_queue.cpp src/file_cache.cpp src/server_logger.cpp -o server
+g++ -std=c++17 -pthread src/client.cpp -o client
 ```
 
 ## Run
@@ -82,6 +86,7 @@ Example:
 - Each request stores the socket fd, filename, client address, arrival time, and file size estimate
 - The bounded queue blocks the acceptor when full and blocks workers when empty
 - Worker threads pop requests and send file contents back to the client
+- Requested filenames are resolved relative to `server_files/`
 - The server continues running until interrupted with `Ctrl+C`
 
 If the file exists, the client prints the contents. If the file does not exist, the client prints:
@@ -199,7 +204,7 @@ Cache hit rate can be estimated afterward by inspecting `server.log`.
 ## Known Limitations
 
 - The server expects the client to send only the filename as raw bytes in a single request
-- File paths are interpreted relative to the server's current working directory
+- The server looks up requested files under `server_files/`
 - The current protocol does not send file metadata such as length, content type, or explicit status codes
 - The shortest-file-first policy uses `stat()` as a best-effort size estimate before service
 
